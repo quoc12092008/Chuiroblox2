@@ -1,5 +1,5 @@
 
-local KT_VERSION = "1.8.1"
+local KT_VERSION = "1.11.0"
 
 --==============================================================================
 -- 1. SERVICES
@@ -172,6 +172,10 @@ local CFG = {
 		MaxSimFloors = 1500,
 		LatencyMargin = 0.08,
 		RefillEvery = 4, -- tối đa 1 lượt nạp boost sau mỗi 4 lượt farm tài nguyên
+		-- TowerClass.new CHỤP damage/health của team đúng 1 LẦN lúc vào tower
+		-- (TowerClass.lua:82-83 nhân BuffService.GetBuff "Damage/Health Multiplier").
+		-- Bật boost giữa lượt thì KHÔNG ăn, nên phải bật trước khi PlayTower.
+		BoostBeforeRun = true,
 	},
 
 	-- ===== Reward + code =====
@@ -222,6 +226,19 @@ local CFG = {
 		UseMoney  = true,  -- Income + Dragon/Cursed/Pirate Income
 		UseDamage = true,  -- Damage ... (đánh mạnh -> clear tower sâu hơn -> nhiều drop hơn)
 		UseSpins = true,
+		-- CỨ CÓ LÀ XÀI: dùng hết boost trong túi, không giữ lại.
+		-- An toàn vì BoostService.useBoost đặt remaining = (còn lại) + duration,
+		-- tức dùng thêm cùng tên thì CỘNG DỒN thời gian chứ không đè mất.
+		-- Boost tier thấp hơn cái đang chạy sẽ nằm chờ trong ActiveEntries
+		-- (không có startedAt nên không trôi giờ), hết cái mạnh thì nó chạy tiếp.
+		-- false = tiết kiệm, chỉ dùng khi tier cao hơn cái đang chạy.
+		UseAll = true,
+		MaxPerTick = 6,   -- mỗi lượt bấm tối đa ngần này cái, tránh spam remote
+		-- Trong túi có nhiều loại spin thì xài cái nào trước?
+		-- "low"  = xài con YẾU trước (Lucky Spin x100), để dành con mạnh  [mặc định]
+		-- "high" = xài con MẠNH trước (Jackpot Spin x1000)
+		-- Số nhân lấy từ SpinConfig.luckMultiplier, không đoán theo tên.
+		SpinOrder = "low",
 	},
 
 	-- Không tự khóa mọi Secret; giữ/bán theo chance plot.
@@ -2962,6 +2979,13 @@ function Tower.tick()
 	if Tower.busy then return end
 	if RT.selling then return end
 
+	-- Buff damage/health được chụp 1 lần lúc TowerClass.new, nên nạp boost TRƯỚC
+	-- khi vào tower; bật giữa chừng thì lượt đó không được tính.
+	if CFG.Tower.BoostBeforeRun ~= false and CFG.Boost.Enabled
+		and type(RT.boostHook) == "function" then
+		pcall(RT.boostHook)
+	end
+
 	if CFG.Tower.AutoTeam and Net.BestTeam then
 		RT.busyTeam = true
 		pcall(function() Net.BestTeam:FireServer() end)
@@ -3196,27 +3220,49 @@ local function boostTick()
 				end
 			end
 		end
-		local best = {}
+		local best, queue = {}, {}
 		for key, e in pairs(inv) do
 			if type(e) == "table" and e.name and (e.amount or 0) > 0 then
 				local cfg = select(2, pcall(Mods.EntryRegistry.getEntryConfig, e.name))
 				if type(cfg) == "table" and cfg.kind == "Boost" and cfg.category
 					and not Game.isLocked(e.name) then
 					local kind = Game.boostKind(cfg.category)
-					if kind and want[kind] and (cfg.tier or 0) > (busyCat[cfg.category] or 0) then
-						local cur = best[cfg.category]
-						if not cur or (cfg.tier or 0) > cur.tier then
-							best[cfg.category] = { key = key, tier = cfg.tier or 0, name = e.name }
+					if kind and want[kind] then
+						local tier = cfg.tier or 0
+						if CFG.Boost.UseAll then
+							-- xài hết, kể cả tier thấp: chúng xếp hàng trong ActiveEntries
+							queue[#queue + 1] = { key = key, tier = tier, name = e.name }
+						elseif tier > (busyCat[cfg.category] or 0) then
+							local cur = best[cfg.category]
+							if not cur or tier > cur.tier then
+								best[cfg.category] = { key = key, tier = tier, name = e.name }
+							end
 						end
 					end
 				end
 			end
 		end
-		for _, b in pairs(best) do
-			pcall(function() Net.BoostUse:FireServer(b.key) end)
-			Util.log("Boost", "dùng " .. b.name)
-			used = used + 1
-			task.wait(0.3)
+		if CFG.Boost.UseAll then
+			-- mạnh trước cho nó chạy trước; cùng tier thì theo tên cho xác định
+			table.sort(queue, function(a, b)
+				if a.tier == b.tier then return a.name < b.name end
+				return a.tier > b.tier
+			end)
+			local cap = math.max(1, math.floor(tonumber(CFG.Boost.MaxPerTick) or 6))
+			for i = 1, math.min(cap, #queue) do
+				local b = queue[i]
+				pcall(function() Net.BoostUse:FireServer(b.key) end)
+				Util.log("Boost", "dùng " .. b.name)
+				used = used + 1
+				task.wait(0.3)
+			end
+		else
+			for _, b in pairs(best) do
+				pcall(function() Net.BoostUse:FireServer(b.key) end)
+				Util.log("Boost", "dùng " .. b.name)
+				used = used + 1
+				task.wait(0.3)
+			end
 		end
 	end
 
@@ -3236,18 +3282,35 @@ local function boostTick()
 	end
 	if CFG.Boost.UseSpins and CFG.Roll.Enabled and Game.unitCount() < Game.storageCap()
 		and not activeSpin and Net.SpinUse and Mods.EntryRegistry then
+		-- pairs() không có thứ tự, trước đây gặp con nào xài con đó nên có lúc đốt
+		-- Jackpot trong khi Lucky vẫn còn. Giờ chọn theo luckMultiplier cho xác định.
+		local pick
 		for key, e in pairs(inv) do
-			if type(e) == "table" and e.name and (e.amount or 0) > 0 then
-				local cfg = select(2, pcall(Mods.EntryRegistry.getEntryConfig, e.name))
+			if type(e) == "table" and e.name and (e.amount or 0) > 0
 				-- Game.isLocked gồm cả LockedItems lẫn món đang giữ để đổi acc.
-				if type(cfg) == "table" and cfg.kind == "Spin" and not Game.isLocked(e.name) then
-					pcall(function() Net.SpinUse:FireServer(key) end)
-					Util.log("Boost", "dùng " .. e.name)
-					used = used + 1
-					task.wait(0.3)
-					break
+				and not Game.isLocked(e.name) then
+				local cfg = select(2, pcall(Mods.EntryRegistry.getEntryConfig, e.name))
+				if type(cfg) == "table" and cfg.kind == "Spin" then
+					local cand = { key = key, name = e.name, mult = tonumber(cfg.luckMultiplier) or 0 }
+					if not pick then
+						pick = cand
+					elseif cand.mult ~= pick.mult then
+						if CFG.Boost.SpinOrder == "high" then
+							if cand.mult > pick.mult then pick = cand end
+						elseif cand.mult < pick.mult then
+							pick = cand
+						end
+					elseif cand.name < pick.name then
+						pick = cand -- cùng số nhân: chốt theo tên cho khỏi đổi lung tung
+					end
 				end
 			end
+		end
+		if pick then
+			pcall(function() Net.SpinUse:FireServer(pick.key) end)
+			Util.log("Boost", string.format("dùng %s (luck x%s)", pick.name, tostring(pick.mult)))
+			used = used + 1
+			task.wait(0.3)
 		end
 	end
 
@@ -3265,6 +3328,10 @@ local function boostTick()
 	RT.boostRunningNames = table.concat(names, ", ")
 	RT.status.Boost = used > 0 and ("dùng " .. used) or RT.boostText
 end
+
+-- Tower cần gọi boostTick trước khi vào lượt, nhưng boostTick khai báo sau Tower.
+-- Gắn qua RT để khỏi phải forward-declare.
+RT.boostHook = boostTick
 
 --==============================================================================
 -- 16. KHỞI ĐỘNG
