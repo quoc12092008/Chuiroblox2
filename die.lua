@@ -1,5 +1,5 @@
 
-local KT_VERSION = "1.8.0"
+local KT_VERSION = "1.8.1"
 
 --==============================================================================
 -- 1. SERVICES
@@ -1482,6 +1482,9 @@ function AccountSwap.count()
 end
 
 -- Đang chờ đổi acc thì giữ món điều kiện lại, không cho module khác tiêu.
+-- LƯU Ý: KeepItem chỉ có tác dụng khi AccountSwap.Enabled = true.
+-- Chồng đổi acc bằng file autochange.lua riêng (AccountSwap tắt) thì phải giữ Jackpot
+-- bằng CFG.LockedItems, không phải bằng KeepItem. boostTick có cảnh báo nhắc chuyện này.
 function AccountSwap.armed()
 	if not CFG.AccountSwap.Enabled or RT.swapDone then return false end
 	return CFG.AccountSwap.KeepItem == true
@@ -3215,6 +3218,15 @@ local function boostTick()
 			used = used + 1
 			task.wait(0.3)
 		end
+	end
+
+	-- Cảnh báo 1 lần: bật KeepItem nhưng AccountSwap tắt thì món đó KHÔNG được giữ.
+	if not RT.keepItemWarned and CFG.Boost.UseSpins and CFG.AccountSwap.KeepItem == true
+		and not CFG.AccountSwap.Enabled and type(CFG.AccountSwap.Item) == "string"
+		and CFG.AccountSwap.Item ~= "" and not Game.isLocked(CFG.AccountSwap.Item) then
+		RT.keepItemWarned = true
+		Util.log("Boost", "CẢNH BÁO: KeepItem không có tác dụng khi AccountSwap tắt. Muốn giữ "
+			.. CFG.AccountSwap.Item .. " thì thêm vào LockedItems.")
 	end
 
 	local activeSpin = false
