@@ -1,5 +1,5 @@
 
-local KT_VERSION = "1.11.0"
+local KT_VERSION = "1.11.1"
 
 --==============================================================================
 -- 1. SERVICES
@@ -556,6 +556,9 @@ end
 --==============================================================================
 -- 6. GAME MATH (bám đúng source)
 --==============================================================================
+-- AccountSwap gán ở mục 9 nhưng Game.isLocked (mục 6) đã cần -> phải khai báo
+-- local TRƯỚC, nếu không thân hàm sẽ tra biến global và luôn nhận nil.
+local AccountSwap = {}
 local Game = {}
 
 -- ngưỡng chance -> rarity, UnitConfig.lua:14-25 (bảng u2, module không export nên chép lại)
@@ -804,8 +807,8 @@ function Game.isLocked(name)
 	for _, locked in ipairs(CFG.LockedItems or {}) do
 		if type(locked) == "string" and locked:lower() == want then return true end
 	end
-	-- AccountSwap khai báo sau Game trong file; guard cho chắc nếu load dở.
-	if type(AccountSwap.armed) == "function" and AccountSwap.armed()
+	-- Guard 2 lớp: bảng có thể chưa gán xong nếu file load dở.
+	if type(AccountSwap) == "table" and type(AccountSwap.armed) == "function" and AccountSwap.armed()
 		and type(CFG.AccountSwap.Item) == "string"
 		and CFG.AccountSwap.Item:lower() == want then
 		return true
@@ -867,7 +870,7 @@ end
 local Keep = {}
 local Notice = {}
 local TicketShop = {}
-local AccountSwap = {}
+-- AccountSwap đã khai báo local ở mục 6 (trước Game), ở đây chỉ gán.
 local Performance = {}
 local WorldCleanup = {}
 
