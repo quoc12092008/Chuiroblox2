@@ -1,10 +1,11 @@
 
 
-local AC_VERSION = "1.0.0"
+local AC_VERSION = "1.2.0"
 local Svc = {
 	Players = game:GetService("Players"),
 	RS      = game:GetService("ReplicatedStorage"),
 	UIS     = game:GetService("UserInputService"),
+	Http    = game:GetService("HttpService"),
 }
 local LP = Svc.Players.LocalPlayer
 if not LP then
@@ -24,10 +25,27 @@ local CFG = {
 	Item     = "Jackpot Spin",   -- món làm điều kiện (tên đúng như trong túi)
 	Amount   = 1,                -- có >= ngần này thì đổi acc
 
+	-- Cách đổi acc:
+	--   "farmsync" = getgenv().client:ChangeToFolder(...)   [mặc định, như cũ]
+	--   "api"      = POST /api/accounts/autoswap-complete   [dashboard v5]
+	Backend = "farmsync",
+
+	-- ===== Dùng cho Backend = "farmsync" =====
 	FromFolder = "",             -- ID folder acc chính
 	ToFolder   = "",             -- ID folder acc thay thế
 	Replace    = false,          -- tham số 3 của ChangeToFolder
 	-- ConfigId = "id_config_moi",  -- tham số 4, bỏ dấu -- nếu muốn đổi config
+
+	-- ===== Dùng cho Backend = "api" =====
+	-- Spec do chồng cung cấp, KHÔNG nằm trong source game.
+	Api = {
+		Url      = "",           -- gốc dashboard, vd "https://abc.xyz" (KHÔNG kèm /api/...)
+		Key      = "",           -- ak_xxx — nên tạo key loại "Complete early only"
+		AuthMode = "x-api-key",  -- "x-api-key" | "bearer"
+		Username = "",           -- rỗng = tự lấy tên acc đang chơi
+		Option   = 1,            -- số thứ tự rule trong Autoswap Config (#1, #2...)
+		RetryEvery = 60,         -- chưa đổi được thì cứ ngần này giây gọi lại 1 lần
+	},
 
 	RetryOnFail = true,          -- FarmSync trả về false thì lượt sau thử lại
 	Log = true,                  -- in ra console
@@ -61,6 +79,8 @@ local RT = {
 	status  = "khởi động",
 	count   = 0,
 	fired   = false,
+	apiTries = 0,       -- đếm để in log cho dễ theo dõi, không dùng để dừng
+	apiNextAt = 0,      -- mốc thời gian sớm nhất được phép gọi API lại
 	log     = {},
 }
 
@@ -107,10 +127,22 @@ end
 
 function AC.decide(count)
 	if not CFG.Enabled then return false, "tắt" end
-	if RT.fired then return false, "đã gọi đổi acc, chờ FarmSync" end
-	if type(CFG.FromFolder) ~= "string" or CFG.FromFolder == ""
-		or type(CFG.ToFolder) ~= "string" or CFG.ToFolder == "" then
-		return false, "chưa điền FromFolder/ToFolder"
+	if RT.fired then return false, "đã gọi đổi acc, chờ xử lý" end
+	if CFG.Backend == "api" then
+		local api = CFG.Api or {}
+		local wait = (RT.apiNextAt or 0) - AC.now()
+		if wait > 0 then
+			return false, string.format("%ds nữa gọi lại API", math.ceil(wait))
+		end
+		if type(api.Url) ~= "string" or api.Url == "" then return false, "chưa điền Api.Url" end
+		if type(api.Key) ~= "string" or api.Key == "" then return false, "chưa điền Api.Key" end
+		-- spec: option = 0 chắc chắn trả 400, chặn luôn ở client cho đỡ tốn request
+		if (tonumber(api.Option) or 0) < 1 then return false, "Api.Option phải >= 1" end
+	else
+		if type(CFG.FromFolder) ~= "string" or CFG.FromFolder == ""
+			or type(CFG.ToFolder) ~= "string" or CFG.ToFolder == "" then
+			return false, "chưa điền FromFolder/ToFolder"
+		end
 	end
 	local need = math.max(1, math.floor(tonumber(CFG.Amount) or 1))
 	if count < need then
@@ -127,7 +159,7 @@ function AC.client()
 	return client, nil
 end
 
-function AC.change(reason)
+function AC.changeFarmSync(reason)
 	local client, why = AC.client()
 	if not client then
 		RT.status = why
@@ -157,8 +189,143 @@ function AC.change(reason)
 	return false
 end
 
-function AC.Force()
+
+--==============================================================================
+--  BACKEND "api" — POST /api/accounts/autoswap-complete
+--  Spec do chồng cung cấp (dashboard v5). KHÔNG phải remote của game AnimeDice.
+--==============================================================================
+
+-- Tách ra để test offline điều khiển được thời gian.
+function AC.now()
+	return os.clock()
+end
+
+-- Executor nào cũng đặt tên khác nhau; dò hết rồi báo rõ nếu không có cái nào.
+function AC.httpFn()
+	local fn
+	pcall(function() fn = (syn and syn.request) or (http and http.request) end)
+	if type(fn) ~= "function" then pcall(function() fn = http_request end) end
+	if type(fn) ~= "function" then pcall(function() fn = request end) end
+	if type(fn) ~= "function" then return nil, "executor không có hàm request()" end
+	return fn, nil
+end
+
+-- Che API key khi in log: chỉ giữ 10 ký tự đầu.
+function AC.maskKey(key)
+	if type(key) ~= "string" or key == "" then return "(trống)" end
+	if #key <= 10 then return key end
+	return key:sub(1, 10) .. "..."
+end
+
+-- Ghép URL, bỏ dấu / thừa ở cuối để không thành "//api".
+function AC.apiUrl(base)
+	base = tostring(base or "")
+	while base:sub(-1) == "/" do base = base:sub(1, -2) end
+	return base .. "/api/accounts/autoswap-complete"
+end
+
+-- HÀM THUẦN: dịch (status, body) -> quyết định. Tách riêng để test offline.
+-- Trả về: done, retry, dead, msg
+function AC.apiOutcome(status, body)
+	status = tonumber(status) or 0
+	if status == 403 then
+		return false, false, true, "403 — thiếu hoặc sai API key"
+	end
+	if status == 404 then
+		return false, false, true, "404 — dashboard không có account tên này"
+	end
+	if status == 400 then
+		return false, true, false, "400 — acc chưa gán device, hoặc Option = 0"
+	end
+	if status < 200 or status >= 300 then
+		return false, true, false, status .. " — máy chủ/mạng lỗi"
+	end
+	local ok, data = pcall(function() return Svc.Http:JSONDecode(body) end)
+	if not ok or type(data) ~= "table" then
+		return false, true, false, "không đọc được JSON trả về"
+	end
+	local outcome = tostring(data.outcome)
+	if outcome == "swapped" then
+		return true, false, false, "swapped — acc thay thế: " .. tostring(data.replacement)
+	end
+	if outcome == "moved" then
+		return true, false, false, "moved — acc đã ra, không có acc thay thế"
+	end
+	if outcome == "not_fired" then
+		-- spec: an toàn để thử lại
+		return false, true, false, "not_fired — sai số rule / rule đang pause / không có acc trống"
+	end
+	return false, true, false, "outcome lạ: " .. outcome
+end
+
+function AC.changeApi(reason)
+	local api = CFG.Api or {}
+	local fn, why = AC.httpFn()
+	if not fn then
+		RT.status = why
+		log(why)
+		return false
+	end
+
+	local user = api.Username
+	if type(user) ~= "string" or user == "" then user = LP.Name end
+	local option = math.max(1, math.floor(tonumber(api.Option) or 1))
+	local url = AC.apiUrl(api.Url)
+
+	local headers = { ["Content-Type"] = "application/json" }
+	if tostring(api.AuthMode):lower() == "bearer" then
+		headers["Authorization"] = "Bearer " .. tostring(api.Key)
+	else
+		headers["X-Api-Key"] = tostring(api.Key)
+	end
+
+	RT.fired = true
+	RT.apiTries = (RT.apiTries or 0) + 1
+	log(string.format("%s -> POST %s | user=%s option=%d key=%s",
+		tostring(reason), url, user, option, AC.maskKey(api.Key)))
+
+	local okCall, res = pcall(function()
+		return fn({
+			Url = url,
+			Method = "POST",
+			Headers = headers,
+			Body = Svc.Http:JSONEncode({ username = user, option = option }),
+		})
+	end)
+	if not okCall or type(res) ~= "table" then
+		RT.fired = false
+		RT.status = "gọi request() lỗi"
+		log("request() lỗi: " .. tostring(res))
+		return false
+	end
+
+	local done, _, dead, msg = AC.apiOutcome(res.StatusCode, res.Body)
+	log("API: " .. msg)
+	if done then
+		RT.status = "đã đổi acc — " .. msg
+		return true
+	end
+	-- Chưa đổi được thì cứ hẹn giờ gọi lại, không bỏ cuộc.
+	-- 403/404 thì thử lại cũng không tự hết, nhưng vẫn gọi theo ý chồng;
+	-- chỉ in log to cho dễ thấy mà đi sửa key/username.
+	if dead then
+		log("CHÚ Ý: lỗi này không tự hết. Kiểm tra Api.Key và Api.Username trên dashboard.")
+	end
+	local every = math.max(5, tonumber(api.RetryEvery) or 60)
 	RT.fired = false
+	RT.apiNextAt = AC.now() + every
+	RT.status = string.format("lần %d hỏng (%s), %ds nữa thử lại", RT.apiTries, msg, every)
+	return false
+end
+
+-- Router: chọn backend theo config.
+function AC.change(reason)
+	if CFG.Backend == "api" then return AC.changeApi(reason) end
+	return AC.changeFarmSync(reason)
+end
+
+function AC.Force()
+	RT.fired, RT.apiTries, RT.apiNextAt = false, 0, 0
 	return AC.change("gọi tay")
 end
 
